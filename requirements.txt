@@ -6,3 +6,7 @@ apscheduler
 pytz
 urllib3
 PyPDF2
+# Required by the ASE (Jordan) scraper. Also needs a real Chrome/Chromium binary
+# on the host - `pip install` alone is not enough.
+selenium
+webdriver-manager

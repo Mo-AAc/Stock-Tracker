@@ -301,30 +301,63 @@ def scrape_iraq_disclosures():
     status_box.empty()
     return data
 
-def scrape_jordan_disclosures(base_url):
+# Resolved once per process. ChromeDriverManager().install() does an online version
+# check on every call, which was being paid 17 times per run.
+_ASE_DRIVER_PATH = None
+_ASE_DRIVER = None
+
+def _close_ase_driver():
+    """Shut down the shared ASE driver if one is open. Safe to call any number of times."""
+    global _ASE_DRIVER
+    if _ASE_DRIVER is not None:
+        try:
+            _ASE_DRIVER.quit()
+        except Exception as e:
+            print(f"ASE driver cleanup failed (continuing): {e}")
+        _ASE_DRIVER = None
+
+def make_ase_driver():
+    """Build the single Chrome instance reused for an entire ASE sweep.
+
+    ASE fronts the disclosures page with a Queue-it waiting room, and Queue-it admits a
+    browser *session*, not a request. Creating a driver per symbol meant re-entering the
+    queue 17 times per run. One session for the whole sweep queues once and replays the
+    admission cookie for the remaining symbols.
+    """
+    global _ASE_DRIVER_PATH, _ASE_DRIVER
+    # Reap a driver orphaned by a run that died before its cleanup line. Without this a
+    # crashed sweep leaves a ~750 MB Chrome tree resident until the service restarts.
+    _close_ase_driver()
+
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--log-level=3")
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--window-size=1920,1080')
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+    if _ASE_DRIVER_PATH is None:
+        _ASE_DRIVER_PATH = ChromeDriverManager().install()
+    _ASE_DRIVER = webdriver.Chrome(service=Service(_ASE_DRIVER_PATH), options=chrome_options)
+    return _ASE_DRIVER
+
+def scrape_jordan_disclosures(base_url, driver):
+    """Scrape one ASE symbol using a caller-supplied driver.
+
+    The caller owns the driver's lifetime — do not create or quit it here, or the
+    Queue-it admission cookie is thrown away between symbols.
+    """
     data = []
     try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.chrome.service import Service
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        from webdriver_manager.chrome import ChromeDriverManager
-        
-        # Set up Chrome browser
-        # Set up an invisible, silent Chrome browser
-        chrome_options = Options()
-        chrome_options.add_argument("--headless=new") 
-        chrome_options.add_argument("--log-level=3")
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        
-        chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        
+
         for page_num in range(0, 5):
             url = base_url if page_num == 0 else (f"{base_url}&page={page_num}" if "?" in base_url else f"{base_url}?page={page_num}")
             
@@ -411,13 +444,16 @@ def scrape_jordan_disclosures(base_url):
             if not correct_table_found or added_on_this_page == 0:
                 break
                 
-        driver.quit() 
         return data
-        
+
+    except ImportError as e:
+        # A missing dependency is a broken deployment, not "this symbol has no
+        # disclosures". Swallowing it here is what hid a ten-day ASE outage behind
+        # a cheerful "0 updates found". Let it reach the user.
+        print(f"ASE FATAL: selenium stack not installed - {e}")
+        raise
     except Exception as e:
-        print(f"ASE Browser Scrape Error: {e}")
-        try: driver.quit() 
-        except: pass
+        print(f"ASE Browser Scrape Error on {base_url}: {e}")
         return data
 
 def scrape_pcma_disclosures():
@@ -592,9 +628,11 @@ def process_updates(market_name, is_background_job=False, manual_start=None, man
     
     if market_name == "Jordan (Amman Stock Exchange)":
         market_data = MARKETS[market_name]
+        # One browser for the whole 17-symbol sweep — see make_ase_driver().
+        ase_driver = make_ase_driver()
         for symbol in market_data["companies"].keys():
             search_url = f"{market_data['url']}?symbol={symbol}"
-            scraped_data = scrape_jordan_disclosures(search_url)
+            scraped_data = scrape_jordan_disclosures(search_url, ase_driver)
             if not scraped_data: continue
 
             for item in scraped_data:
@@ -639,6 +677,8 @@ def process_updates(market_name, is_background_job=False, manual_start=None, man
                     # Do not save to memory if it's a manual run
                     if not (manual_start and manual_end): seen_disclosures.append(unique_id)
                     updates_found += 1
+
+        _close_ase_driver()
 
     elif market_name == "Palestine (PEX & PCMA)":
         pcma_data = scrape_pcma_disclosures()
