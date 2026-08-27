@@ -40,7 +40,6 @@ def inject_custom_css():
     """, unsafe_allow_html=True)
 
 # --- CONFIGURATION ---
-CREDENTIALS = {"admin": "AAC@2010"} 
 STATE_FILE = "last_run.json"
 LOGO_FILE = "Logo.png" 
 
@@ -813,23 +812,6 @@ def start_background_scheduler():
 
 global_scheduler = start_background_scheduler()
 
-def login():
-    _, col_login, _ = st.columns([1, 2, 1])
-    with col_login:
-        if os.path.exists(LOGO_FILE):
-            with open(LOGO_FILE, "rb") as _f: _enc = base64.b64encode(_f.read()).decode()
-            st.markdown(f'<div style="text-align:center"><img src="data:image/png;base64,{_enc}" width="250"></div>',
-            unsafe_allow_html=True)
-        st.title("Stock Tracker")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Login", type="primary", use_container_width=True):
-            if CREDENTIALS.get(username) == password:
-                st.session_state["logged_in"] = True
-                st.query_params["auth"] = "true" 
-                st.rerun()
-            else: st.error("Invalid Username or Password")
-
 @st.dialog("✅ Background Updates Auto-Loaded!")
 def auto_load_popup(count):
     st.success(f"The server extracted {count} updates while you were away!")
@@ -839,8 +821,6 @@ def main_app():
     if os.path.exists(LOGO_FILE):
         with open(LOGO_FILE, "rb") as image_file: encoded_string = base64.b64encode(image_file.read()).decode()
         st.markdown(f"""<style>.floating-logo {{ position: fixed; top: 80px; left: 30px; width: 250px; z-index: 999999; }}</style><img src="data:image/png;base64,{encoded_string}" class="floating-logo">""", unsafe_allow_html=True)
-
-    st.markdown("""<style>.logout-widget { position: fixed; top: 80px; right: 30px; z-index: 999999; text-align: center; } .logout-btn { background-color: #004475; color: #FFFFFF !important; border: 1px solid #004475; padding: 0.4rem 1.2rem; border-radius: 0.5rem; text-decoration: none !important; display: inline-block; font-weight: 600; } .logout-btn:hover { color: #FFFFFF !important; background-color: #003355; }</style><div class="logout-widget"><a href="?logout=true" target="_parent" class="logout-btn">Logout</a><div style="color:gray; font-size:0.85em; margin-top:5px;">👤 Admin</div></div>""", unsafe_allow_html=True)
 
     st.title("📈 Stock Market Updates")
     st.write("Multi-Market Disclosures Tracker")
@@ -963,23 +943,4 @@ def main_app():
 
 load_theme()
 inject_custom_css()  
-
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-
-query_params = st.query_params.to_dict() if hasattr(st.query_params, "to_dict") else st.query_params
-
-if query_params.get("logout") == "true" or query_params.get("logout") == ["true"]:
-    st.session_state.clear()
-    st.session_state["logged_in"] = False
-    st.query_params.clear()
-    time.sleep(0.1)
-    st.rerun()
-    
-elif query_params.get("auth") == "true" or query_params.get("auth") == ["true"]:
-    st.session_state["logged_in"] = True
-
-if not st.session_state["logged_in"]:
-    login()
-else:
-    main_app()
+main_app()
