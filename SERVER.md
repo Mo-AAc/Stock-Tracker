@@ -112,9 +112,21 @@ sudo -u stockapp git checkout -- last_run.json   # tracked but app-rewritten; al
 sudo -u stockapp git pull
 sudo -u stockapp .venv/bin/pip install -r requirements.txt
 sudo -u stockapp .venv/bin/pip install -r /opt/stocktracker-extra-requirements.txt
-sudo -u stockapp test -f .streamlit/secrets.toml || echo 'MISSING: create it per section 6 before restarting'
+sudo -u stockapp test -f .streamlit/secrets.toml || { echo 'MISSING: create it per section 6'; exit 1; }
 sudo systemctl restart stock-tracker
 ```
+
+**Check the Streamlit version before the first pull that carries cookie auth.**
+`requirements.txt` now pins `streamlit>=1.42` because `st.context.cookies` is the cookie read
+path. If the venv is older, `pip install` will bump the framework in the same restart as the
+auth change and you will not know which one broke the page:
+
+```bash
+sudo -u stockapp .venv/bin/pip show streamlit | grep ^Version
+```
+
+Below 1.42, upgrade Streamlit on its own, verify the tracker still renders, then deploy the
+auth change.
 
 **Do not skip the second `pip install`** — omitting it reproduces the outage in §2.
 
@@ -142,7 +154,7 @@ ss -tlnp | grep ':8501 '
 | `/stocks/` loads but nothing is interactive | Missing WebSocket headers | Add `Upgrade` / `Connection "upgrade"` + the `_stcore/stream` block |
 | `/stocks/` returns another app's 404 | nginx not reloaded — `nginx -t` only validates the file on disk | `nginx -t && systemctl reload nginx` |
 | `502 Bad Gateway` | Streamlit process down | `systemctl status stock-tracker`; `journalctl -u stock-tracker -n 50` |
-| Login page 500s, or `KeyError: 'stock_tracker_auth'` in the log | `secrets.toml` missing or unreadable by `stockapp` | Recreate it per §6; `chown stockapp` and `chmod 600` |
+| Login page renders, but submitting raises `KeyError: 'stock_tracker_auth'` | `secrets.toml` missing or unreadable by `stockapp` — the page itself renders fine without it, so the failure only shows on submit | Recreate it per §6; `chown stockapp` and `chmod 600` |
 | Login succeeds but every reload asks again | Cookie path mismatch, or the app is reached on a URL other than `/stocks/` | Cookie is scoped to `/stocks/`; confirm the URL and `auth.COOKIE_PATH` agree |
 | `git pull` blocked | `last_run.json` | Back it up, `git checkout --` it, pull |
 | `git pull` asks for a password | Remote reverted to HTTPS, or wrong user | `git remote -v`; always `sudo -u stockapp` |
