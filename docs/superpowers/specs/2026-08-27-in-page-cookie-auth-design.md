@@ -7,8 +7,9 @@ in the browser and never accepting authentication state from a URL.
 
 ## Chosen approach
 
-The Streamlit app will use a cookie component to set and remove an encrypted, signed login
-cookie. The app will validate the cookie before rendering the tracker and will only create it
+The Streamlit app will use a cookie component to set and remove an HMAC-signed login
+cookie. The payload is signed, not encrypted: it is readable by the browser but cannot be
+forged or extended without the server's key. The app will validate the cookie before rendering the tracker and will only create it
 after a successful username/password check.
 
 The password and cookie-signing key will be read from the server's untracked
