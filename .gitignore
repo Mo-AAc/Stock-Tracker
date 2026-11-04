@@ -10,3 +10,6 @@ __pycache__/
 *.sqlite3
 *.db
 Stock_Update_Draft.eml
+
+# Server-only login credential and cookie signing key - never commit
+.streamlit/secrets.toml

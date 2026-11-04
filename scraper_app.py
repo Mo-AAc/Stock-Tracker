@@ -13,6 +13,9 @@ from pytz import timezone
 import base64  
 import urllib3
 import re
+from streamlit_cookies_controller import CookieController
+
+import auth
 
 # Suppress insecure request warnings for regional sites
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -40,6 +43,9 @@ def inject_custom_css():
     """, unsafe_allow_html=True)
 
 # --- CONFIGURATION ---
+# Give the cookie component time to write to document.cookie before the rerun
+# tears down the current render.
+COOKIE_WRITE_GRACE_SECONDS = 0.3
 STATE_FILE = "last_run.json"
 LOGO_FILE = "Logo.png" 
 
@@ -812,15 +818,55 @@ def start_background_scheduler():
 
 global_scheduler = start_background_scheduler()
 
+def login(cookie_controller):
+    """Render the in-page login and, on success, persist a signed session cookie."""
+    _, col_login, _ = st.columns([1, 2, 1])
+    with col_login:
+        if os.path.exists(LOGO_FILE):
+            with open(LOGO_FILE, "rb") as _f: _enc = base64.b64encode(_f.read()).decode()
+            st.markdown(f'<div style="text-align:center"><img src="data:image/png;base64,{_enc}" width="250"></div>',
+            unsafe_allow_html=True)
+        st.title("Stock Tracker")
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
+        if submitted:
+            if auth.check_credentials(username, password):
+                cookie_controller.set(
+                    auth.COOKIE_NAME,
+                    auth.issue_session(now=time.time()),
+                    path=auth.COOKIE_PATH,
+                    max_age=auth.SESSION_MAX_AGE_SECONDS,
+                    same_site="lax",
+                )
+                st.session_state[auth.SESSION_STATE_KEY] = True
+                time.sleep(COOKIE_WRITE_GRACE_SECONDS)
+                st.rerun()
+            else:
+                st.error("Invalid Username or Password")
+
 @st.dialog("✅ Background Updates Auto-Loaded!")
 def auto_load_popup(count):
     st.success(f"The server extracted {count} updates while you were away!")
     if st.button("Awesome, thanks!"): st.rerun()
 
-def main_app():
+def main_app(cookie_controller):
     if os.path.exists(LOGO_FILE):
         with open(LOGO_FILE, "rb") as image_file: encoded_string = base64.b64encode(image_file.read()).decode()
         st.markdown(f"""<style>.floating-logo {{ position: fixed; top: 80px; left: 30px; width: 250px; z-index: 999999; }}</style><img src="data:image/png;base64,{encoded_string}" class="floating-logo">""", unsafe_allow_html=True)
+
+    _, col_logout = st.columns([6, 1])
+    with col_logout:
+        if st.button("Logout", use_container_width=True):
+            cookie_controller.remove(auth.COOKIE_NAME, path=auth.COOKIE_PATH)
+            st.session_state.clear()
+            # Set after clear(): the stale cookie header would otherwise re-authenticate
+            # this session on the next rerun.
+            st.session_state[auth.SESSION_STATE_KEY] = False
+            time.sleep(COOKIE_WRITE_GRACE_SECONDS)
+            st.rerun()
+        st.caption("👤 Admin")
 
     st.title("📈 Stock Market Updates")
     st.write("Multi-Market Disclosures Tracker")
@@ -943,4 +989,19 @@ def main_app():
 
 load_theme()
 inject_custom_css()  
-main_app()
+
+cookie_controller = CookieController()
+
+# The browser cookie is the durable session. `st.context.cookies` is captured from
+# the request headers when the Streamlit session opens and never changes afterwards,
+# so it is consulted exactly once - later reruns follow login and logout, which set
+# this flag directly.
+if auth.SESSION_STATE_KEY not in st.session_state:
+    st.session_state[auth.SESSION_STATE_KEY] = auth.is_authenticated(
+        st.context.cookies.get(auth.COOKIE_NAME), now=time.time()
+    )
+
+if st.session_state[auth.SESSION_STATE_KEY]:
+    main_app(cookie_controller)
+else:
+    login(cookie_controller)

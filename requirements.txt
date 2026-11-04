@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.42
 requests
 beautifulsoup4
 pandas
@@ -10,3 +10,6 @@ PyPDF2
 # on the host - `pip install` alone is not enough.
 selenium
 webdriver-manager
+
+# Signed 30-day login cookie set by the in-page login form.
+streamlit-cookies-controller
