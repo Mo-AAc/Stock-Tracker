@@ -1,5 +1,14 @@
 # Deployment Guide
 
+> **Superseded on 2026-07-29. This describes a generic install, not how the app actually
+> runs.** Read `SERVER.md` (repo root) instead: production runs under the systemd unit
+> `stock-tracker` as the restricted user `stockapp`, bound to `127.0.0.1:8501` behind nginx at
+> `/stocks/` — not `streamlit run` under `screen`. Two corrections that have caused real
+> outages: the host also needs a **`google-chrome-stable` binary** (`pip install` alone is not
+> enough, and the failure is silently swallowed — `SERVER.md` §2), and **`last_run.json` is
+> deployed** and is the app's live state file, contrary to "Optional files and cleanup" below.
+> Full list in `SERVER.md` §5; platform-wide context in `C:\Dev\_platform\PLATFORM.md`.
+
 ## Overview
 This repository contains a Streamlit-based alert system application (`scraper_app.py`). It is ready to deploy on an Ubuntu Linux server after installing the required Python dependencies and ensuring file naming is Linux-safe.
 
