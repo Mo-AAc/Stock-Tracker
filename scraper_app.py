@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
+from contextlib import closing
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 import json
@@ -12,6 +13,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from pytz import timezone
 import base64  
 import urllib3
+from urllib.parse import urlencode, urljoin
 import re
 from streamlit_cookies_controller import CookieController
 
@@ -49,9 +51,19 @@ COOKIE_WRITE_GRACE_SECONDS = 0.3
 STATE_FILE = "last_run.json"
 LOGO_FILE = "Logo.png" 
 
+ASE_DISCLOSURE_URLS = (
+    "https://www.ase.com.jo/en/disclosure",
+    "https://www.exchange.jo/en/disclosure",
+)
+ASE_DISCLOSURE_VIEW = ".view-ase-circulars-disclosures.view-display-id-page_2"
+ASE_FILE_COLUMNS = ("pdf", "xbrl", "xlsx", "zip")
+ASE_MAX_PAGES = 5
+ASE_FILTER_WAIT_SECONDS = 15
+ASE_QUEUE_POLL_SECONDS = 5
+ASE_QUEUE_WAIT_SECONDS = 300
+
 MARKETS = {
     "Jordan (Amman Stock Exchange)": {
-        "url": "https://www.ase.com.jo/en/disclosures",
         "companies": {
             "MEIN": "MIDDLE EAST INSURANCE", "AAIN": "AL-NISR AL-ARABI INSURANCE",
             "JOIN": "JORDAN INSURANCE", "AICJ": "ARABIA INSURANCE COMPANY - JORDAN",
@@ -309,17 +321,15 @@ def scrape_iraq_disclosures():
 # Resolved once per process. ChromeDriverManager().install() does an online version
 # check on every call, which was being paid 17 times per run.
 _ASE_DRIVER_PATH = None
-_ASE_DRIVER = None
 
-def _close_ase_driver():
-    """Shut down the shared ASE driver if one is open. Safe to call any number of times."""
-    global _ASE_DRIVER
-    if _ASE_DRIVER is not None:
-        try:
-            _ASE_DRIVER.quit()
-        except Exception as e:
-            print(f"ASE driver cleanup failed (continuing): {e}")
-        _ASE_DRIVER = None
+def _close_ase_driver(driver):
+    """Release the browser owned by this sweep."""
+    from selenium.common.exceptions import WebDriverException
+
+    try:
+        driver.quit()
+    except WebDriverException as error:
+        print(f"ASE driver cleanup failed: {error}")
 
 def make_ase_driver():
     """Build the single Chrome instance reused for an entire ASE sweep.
@@ -329,10 +339,7 @@ def make_ase_driver():
     queue 17 times per run. One session for the whole sweep queues once and replays the
     admission cookie for the remaining symbols.
     """
-    global _ASE_DRIVER_PATH, _ASE_DRIVER
-    # Reap a driver orphaned by a run that died before its cleanup line. Without this a
-    # crashed sweep leaves a ~750 MB Chrome tree resident until the service restarts.
-    _close_ase_driver()
+    global _ASE_DRIVER_PATH
 
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
@@ -349,117 +356,121 @@ def make_ase_driver():
 
     if _ASE_DRIVER_PATH is None:
         _ASE_DRIVER_PATH = ChromeDriverManager().install()
-    _ASE_DRIVER = webdriver.Chrome(service=Service(_ASE_DRIVER_PATH), options=chrome_options)
-    return _ASE_DRIVER
+    return webdriver.Chrome(service=Service(_ASE_DRIVER_PATH), options=chrome_options)
 
-def scrape_jordan_disclosures(base_url, driver):
-    """Scrape one ASE symbol using a caller-supplied driver.
+class ASEDisclosureUnavailable(RuntimeError):
+    """The current endpoint could not serve a filtered ASE disclosure page."""
 
-    The caller owns the driver's lifetime — do not create or quit it here, or the
-    Queue-it admission cookie is thrown away between symbols.
-    """
-    data = []
+
+def iter_jordan_disclosures(symbols):
+    """Prefer the endpoint that served the last successful search."""
+    preferred_endpoint = ASE_DISCLOSURE_URLS[0]
+    driver = make_ase_driver()
     try:
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-
-        for page_num in range(0, 5):
-            url = base_url if page_num == 0 else (f"{base_url}&page={page_num}" if "?" in base_url else f"{base_url}?page={page_num}")
-            
-            driver.get(url)
-            
-            # --- THE QUEUE FIGHTER ---
-            wait_time = 0
-            while "You are now in line" in driver.page_source or "Queue-it" in driver.page_source:
-                print(f"ASE Queue Detected on Page {page_num}. Waiting in line... ({wait_time} seconds)")
-                time.sleep(5)
-                wait_time += 5
-                if wait_time > 300: 
+        for symbol in symbols:
+            endpoints = sorted(ASE_DISCLOSURE_URLS, key=lambda url: url != preferred_endpoint)
+            for endpoint in endpoints:
+                try:
+                    filings = scrape_jordan_disclosures(endpoint, symbol, driver)
+                except ASEDisclosureUnavailable as error:
+                    print(f"ASE disclosure search failed on {endpoint} for {symbol}: {error}")
+                    last_error = error
+                else:
+                    if endpoint != preferred_endpoint:
+                        print(f"ASE switched to {endpoint} for {symbol}")
+                    preferred_endpoint = endpoint
+                    yield from filings
                     break
-            
-            # 🌟 SMART WAIT: Wait up to 15 seconds for actual data rows to appear in the table
-            try:
-                # We wait until at least one <tr> (table row) inside the <tbody> is present
-                # that does NOT contain the text "No data available"
-                WebDriverWait(driver, 15).until(
-                    lambda d: len(d.find_elements(By.CSS_SELECTOR, "tbody tr")) > 0 and 
-                              "No data available" not in d.find_element(By.CSS_SELECTOR, "tbody").text
-                )
-            except Exception:
-                # If 15 seconds pass and it's still empty, it truly means there are no records
-                print(f"Table remained empty after waiting for {base_url}")
-                pass 
-            
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            
-            tables = soup.find_all('table')
-            correct_table_found = False
-            added_on_this_page = 0
-            
-            for table in tables:
-                tbody = table.find('tbody')
-                rows = tbody.find_all('tr') if tbody else table.find_all('tr')[1:] 
-                
-                if not rows: continue
-                
-                # Check if this table actually has our data (we look for 5+ columns)
-                first_cols = rows[0].find_all(['td', 'th'])
-                if len(first_cols) < 5: 
-                    continue # This is a dummy layout table, skip it!
-                
-                # Check if it's the "No data available" row
-                if "No data available" in rows[0].text:
-                    correct_table_found = True # We found the right table, it's just empty
-                    break 
-                
-                correct_table_found = True # We found the real disclosures table!
-                
-                for row in rows:
-                    cols = row.find_all('td')
-                    if len(cols) < 6: continue
-                    disclosure_name = cols[0].text.strip()
-                    symbol = cols[1].text.strip()
-                    security_name = cols[2].text.strip()
-                    category = cols[3].text.strip()
-                    
-                    raw_date = cols[4].text.strip()
-                    date_match = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{4}', raw_date)
-                    date_str = date_match.group(0) if date_match else raw_date
-                    
-                    file_links = {}
-                    for i, key in enumerate(['pdf', 'xbrl', 'xlsx', 'zip'], start=5):
-                        if len(cols) > i:
-                            tag = cols[i].find('a')
-                            if tag and 'href' in tag.attrs:
-                                link = tag['href']
-                                if not link.startswith('http'): link = "https://www.ase.com.jo" + link
-                                file_links[key] = link
-                    
-                    if not any(d['Disclosure'] == disclosure_name and d['Date'] == date_str for d in data):
-                        data.append({
-                            "Disclosure": disclosure_name, "Symbol": symbol, "Security Name": security_name,
-                            "Category": category, "Date": date_str, "File_Links": file_links
-                        })
-                        added_on_this_page += 1
-                        
-                if correct_table_found:
-                    break # We finished reading the real table, move on
-            
-            # If we didn't find the table or found 0 new files on this page, stop digging
-            if not correct_table_found or added_on_this_page == 0:
-                break
-                
-        return data
+            else:
+                raise ASEDisclosureUnavailable(f"No working ASE disclosure endpoint for {symbol}.") from last_error
+    finally:
+        _close_ase_driver(driver)
 
-    except ImportError as e:
-        # A missing dependency is a broken deployment, not "this symbol has no
-        # disclosures". Swallowing it here is what hid a ten-day ASE outage behind
-        # a cheerful "0 updates found". Let it reach the user.
-        print(f"ASE FATAL: selenium stack not installed - {e}")
-        raise
-    except Exception as e:
-        print(f"ASE Browser Scrape Error on {base_url}: {e}")
-        return data
+
+def scrape_jordan_disclosures(endpoint, search_symbol, driver):
+    """Scrape one ASE symbol with the browser admitted for this sweep."""
+    from selenium.common.exceptions import WebDriverException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    data = {}
+    base_url = f"{endpoint}?{urlencode({'symbol': search_symbol})}"
+    for page_num in range(ASE_MAX_PAGES):
+        url = base_url if page_num == 0 else f"{base_url}&page={page_num}"
+        try:
+            driver.get(url)
+            wait_time = 0
+            page_source = driver.page_source
+            while "You are now in line" in page_source or "Queue-it" in page_source:
+                if wait_time >= ASE_QUEUE_WAIT_SECONDS:
+                    raise ASEDisclosureUnavailable(f"Still in the ASE queue at {url}")
+                print(f"ASE waiting in line on page {page_num} ({wait_time} seconds)")
+                time.sleep(ASE_QUEUE_POLL_SECONDS)
+                wait_time += ASE_QUEUE_POLL_SECONDS
+                page_source = driver.page_source
+
+            if "page not found" in driver.title.casefold():
+                raise ASEDisclosureUnavailable(f"Page not found at {url}")
+
+            WebDriverWait(driver, ASE_FILTER_WAIT_SECONDS).until(
+                lambda browser: browser.find_element(By.ID, "edit-symbol").get_attribute("value") == search_symbol,
+                message=f"Missing matching disclosure filter at {url}",
+            )
+            page_url = driver.current_url
+            page_source = driver.page_source
+        except WebDriverException as error:
+            raise ASEDisclosureUnavailable(f"Browser could not load {url}: {error.msg}") from error
+
+        previous_count = len(data)
+        for filing in parse_ase_disclosure_page(page_source, page_url):
+            key = (filing["Symbol"], filing["Disclosure"], filing["Date"])
+            data.setdefault(key, filing)
+        if len(data) == previous_count:
+            break
+
+    return list(data.values())
+
+
+def parse_ase_disclosure_page(page_source, page_url):
+    """Read the ASE results table or recognize the explicit empty state."""
+    soup = BeautifulSoup(page_source, "html.parser")
+    view = soup.select_one(ASE_DISCLOSURE_VIEW)
+    if view is not None and view.select_one(".view-empty") is not None:
+        return []
+
+    rows = view.select("table.cols-9 > tbody > tr") if view is not None else []
+    if not rows:
+        raise ASEDisclosureUnavailable(f"Missing disclosure results at {page_url}")
+
+    filings = []
+    for row in rows:
+        cells = row.find_all("td", recursive=False)
+        if len(cells) != 5 + len(ASE_FILE_COLUMNS):
+            raise ASEDisclosureUnavailable(f"Unexpected disclosure columns at {page_url}")
+
+        name, symbol, security_name, category, raw_date = (
+            cell.get_text(strip=True) for cell in cells[:5]
+        )
+        date_match = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{4}', raw_date)
+        file_links = {}
+        for column, cell in zip(ASE_FILE_COLUMNS, cells[5:]):
+            link = cell.find("a", href=True)
+            if link and link["href"]:
+                file_url = urljoin(page_url, link["href"])
+                if file_url.startswith(("https://", "http://")):
+                    file_links[column] = file_url
+
+        filings.append({
+            "Disclosure": name,
+            "Symbol": symbol,
+            "Security Name": security_name,
+            "Category": category,
+            "Date": date_match.group(0) if date_match else raw_date,
+            "File_Links": file_links,
+        })
+
+    return filings
+
 
 def scrape_pcma_disclosures():
     url = "https://www.pcma.ps/%d8%a7%d9%81%d8%b5%d8%a7%d8%ad%d8%a7%d8%aa/"
@@ -632,16 +643,13 @@ def process_updates(market_name, is_background_job=False, manual_start=None, man
     email_body = f"Dear Mr. Ala,\n\nPlease find below the latest Stock Exchange updates for {market_name}:\n\n"
     
     if market_name == "Jordan (Amman Stock Exchange)":
-        market_data = MARKETS[market_name]
-        # One browser for the whole 17-symbol sweep — see make_ase_driver().
-        ase_driver = make_ase_driver()
-        for symbol in market_data["companies"].keys():
-            search_url = f"{market_data['url']}?symbol={symbol}"
-            scraped_data = scrape_jordan_disclosures(search_url, ase_driver)
-            if not scraped_data: continue
-
-            for item in scraped_data:
+        companies = MARKETS[market_name]["companies"]
+        with closing(iter_jordan_disclosures(companies)) as disclosures:
+            for item in disclosures:
                 item_symbol = item["Symbol"]
+                # ASE symbol searches can also return broker or other related symbols.
+                if item_symbol not in companies:
+                    continue
                 date_str = item["Date"]
                 file_links = item["File_Links"]
                 disclosure_name = item["Disclosure"]
@@ -659,7 +667,7 @@ def process_updates(market_name, is_background_job=False, manual_start=None, man
                     is_valid_update = (disclosure_date.date() >= last_run_date and unique_id not in active_seen_disclosures)
                 
                 if is_valid_update:
-                    full_company_name = market_data["companies"][item_symbol] 
+                    full_company_name = companies[item_symbol]
                     row_files = [] 
                     if file_links:
                         for ext, link in file_links.items():
@@ -682,8 +690,6 @@ def process_updates(market_name, is_background_job=False, manual_start=None, man
                     # Do not save to memory if it's a manual run
                     if not (manual_start and manual_end): seen_disclosures.append(unique_id)
                     updates_found += 1
-
-        _close_ase_driver()
 
     elif market_name == "Palestine (PEX & PCMA)":
         pcma_data = scrape_pcma_disclosures()
@@ -807,7 +813,14 @@ def process_updates(market_name, is_background_job=False, manual_start=None, man
 
 def scheduled_job():
     cleanup_old_files()
-    for market in MARKETS.keys(): process_updates(market, is_background_job=True)
+    ase_error = None
+    for market in MARKETS:
+        try:
+            process_updates(market, is_background_job=True)
+        except ASEDisclosureUnavailable as error:
+            ase_error = error
+    if ase_error is not None:
+        raise ase_error
 
 @st.cache_resource
 def start_background_scheduler():
@@ -912,7 +925,11 @@ def main_app(cookie_controller):
     if run_pressed:
         with st.spinner(f"Extracting updates from {selected_market}..."):
             cleanup_old_files() 
-            result = process_updates(selected_market, is_background_job=False, manual_start=manual_start, manual_end=manual_end)
+            try:
+                result = process_updates(selected_market, is_background_job=False, manual_start=manual_start, manual_end=manual_end)
+            except ASEDisclosureUnavailable as error:
+                st.error(str(error))
+                return
             if result[0] is None:
                 st.warning("Could not find or parse the tables on the website.")
             else:
